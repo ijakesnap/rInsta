@@ -425,7 +425,7 @@ class InstagramBot {
       if (eventData.thread?.users) {
         const sender = eventData.thread.users.find(u => u.pk?.toString() === message.user_id?.toString());
         if (sender?.username) {
-          senderUsername = sender.username;
+          senderUsername = sender.username.toLowerCase();
         }
       }
 
