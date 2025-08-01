@@ -2,8 +2,8 @@ import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
 
 export class MessageHandler {
-  constructor(instagramBot, moduleManager, telegramBridge) {
-    this.instagramBot = instagramBot;
+  constructor(instagramClient, moduleManager, telegramBridge) {
+    this.instagramClient = instagramClient;
     this.moduleManager = moduleManager;
     this.telegramBridge = telegramBridge;
     this.commandPrefix = '.';
@@ -12,17 +12,17 @@ export class MessageHandler {
   async handleMessage(message) {
     try {
       // Process through modules for stats/logging
-      message = await this.moduleManager.processMessage(message);
+      const processedMessage = await this.moduleManager.processMessage(message);
 
       // Handle commands
-      if (message.text?.startsWith(this.commandPrefix)) {
-        await this.handleCommand(message);
+      if (processedMessage.content?.startsWith(this.commandPrefix)) {
+        await this.handleCommand(processedMessage);
         return;
       }
 
       // Forward to Telegram if enabled
       if (this.telegramBridge?.enabled && config.telegram.enabled) {
-        await this.telegramBridge.sendToTelegram(message);
+        await this.telegramBridge.handleInstagramMessage(processedMessage);
       }
 
     } catch (error) {
@@ -32,7 +32,7 @@ export class MessageHandler {
 
   async handleCommand(message) {
     try {
-      const commandText = message.text.slice(this.commandPrefix.length).trim();
+      const commandText = message.content.slice(this.commandPrefix.length).trim();
       const [commandName, ...args] = commandText.split(' ');
       
       if (!commandName) return;
@@ -44,16 +44,23 @@ export class MessageHandler {
       }
 
       // Admin check
-      if (command.adminOnly && !this.isAdmin(message.senderUsername)) {
+      if (command.adminOnly && !this.isAdmin(message.author?.username)) {
         await this.sendReply(message, '❌ This command requires admin privileges');
         return;
       }
 
       // Log command execution
-      logger.info(`Command executed: .${commandName} by @${message.senderUsername}`);
+      logger.info(`Command executed: .${commandName} by @${message.author?.username || 'unknown'}`);
       
-      // Execute command
-      await command.handler(args, message);
+      // Execute command with proper message format
+      const commandMessage = {
+        threadId: message.chatID,
+        senderUsername: message.author?.username,
+        text: message.content,
+        ...message
+      };
+      
+      await command.handler(args, commandMessage);
       
     } catch (error) {
       logger.error(`Command execution error:`, error.message);
@@ -63,7 +70,7 @@ export class MessageHandler {
 
   async sendReply(message, text) {
     try {
-      await this.instagramBot.sendMessage(message.threadId, text);
+      await this.instagramClient.sendMessage(message.chatID, text);
     } catch (error) {
       logger.error('Error sending reply:', error.message);
     }

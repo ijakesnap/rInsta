@@ -7,14 +7,33 @@ import { EventEmitter } from 'events';
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
 
+// Import our custom functions
+import Chat from '../functions/Chat.js';
+import User from '../functions/User.js';
+import Message from '../functions/Message.js';
+import ClientUser from '../functions/ClientUser.js';
+import Attachment from '../functions/Attachment.js';
+
 export class InstagramClient extends EventEmitter {
   constructor() {
     super();
     this.ig = withRealtime(new IgApiClient());
     this.isConnected = false;
-    this.currentUser = null;
+    this.ready = false;
+    this.user = null; // ClientUser instance
+    this.currentUser = null; // Raw user data
     this.processedMessageIds = new Set();
     this.maxProcessedMessageIds = 1000;
+    
+    // Cache system using our custom classes
+    this.cache = {
+      messages: new Map(),
+      users: new Map(),
+      chats: new Map(),
+      pendingChats: new Map()
+    };
+
+    this.eventsToReplay = [];
   }
 
   async initialize() {
@@ -29,7 +48,19 @@ export class InstagramClient extends EventEmitter {
       await this.setupRealtimeConnection();
       
       this.isConnected = true;
+      this.ready = true;
       this.emit('ready');
+      this.emit('connected');
+      
+      // Replay any events that occurred before ready
+      this.eventsToReplay.forEach((event) => {
+        const eventType = event.shift();
+        if (eventType === 'realtime') {
+          this.handleRealtimeReceive(...event);
+        }
+      });
+      this.eventsToReplay = [];
+      
       logger.info('✅ Instagram client initialized successfully');
     } catch (error) {
       logger.error('❌ Failed to initialize Instagram client:', error.message);
@@ -47,7 +78,8 @@ export class InstagramClient extends EventEmitter {
       await this.ig.state.deserialize(sessionData);
       
       this.currentUser = await this.ig.account.currentUser();
-      logger.info('✅ Logged in from session.json');
+      this.user = new ClientUser(this, this.currentUser);
+      logger.info(`✅ Logged in from session.json as @${this.currentUser.username}`);
       loginSuccess = true;
     } catch (error) {
       logger.debug('Session login failed, trying cookies...');
@@ -58,6 +90,7 @@ export class InstagramClient extends EventEmitter {
       try {
         await this.loadCookiesFromJson('./cookies.json');
         this.currentUser = await this.ig.account.currentUser();
+        this.user = new ClientUser(this, this.currentUser);
         
         // Save session after successful cookie login
         const session = await this.ig.state.serialize();
@@ -81,6 +114,7 @@ export class InstagramClient extends EventEmitter {
     const raw = await fs.readFile(path, 'utf-8');
     const cookies = JSON.parse(raw);
 
+    let cookiesLoaded = 0;
     for (const cookie of cookies) {
       const toughCookie = new tough.Cookie({
         key: cookie.name,
@@ -95,7 +129,10 @@ export class InstagramClient extends EventEmitter {
         toughCookie.toString(),
         `https://${toughCookie.domain}${toughCookie.path}`
       );
+      cookiesLoaded++;
     }
+
+    logger.info(`🍪 Successfully loaded ${cookiesLoaded}/${cookies.length} cookies from file`);
   }
 
   async setupRealtimeConnection() {
@@ -125,8 +162,7 @@ export class InstagramClient extends EventEmitter {
           return;
         }
 
-        const processedMessage = await this.processMessage(data.message, data);
-        this.emit('message', processedMessage);
+        await this.handleMessage(data.message, data);
       } catch (error) {
         logger.error('❌ Error in message handler:', error.message);
       }
@@ -136,17 +172,26 @@ export class InstagramClient extends EventEmitter {
     this.ig.realtime.on('direct', async (data) => {
       try {
         if (data.message && this.isNewMessageById(data.message.item_id)) {
-          const processedMessage = await this.processMessage(data.message, data);
-          this.emit('message', processedMessage);
+          await this.handleMessage(data.message, data);
         }
       } catch (error) {
         logger.error('❌ Error in direct handler:', error.message);
       }
     });
 
+    // Handle realtime receive for advanced features
+    this.ig.realtime.on('receive', (topic, messages) => {
+      if (!this.ready) {
+        this.eventsToReplay.push(['realtime', topic, messages]);
+        return;
+      }
+      this.handleRealtimeReceive(topic, messages);
+    });
+
     // Connection events
     this.ig.realtime.on('connect', () => {
       logger.info('🔗 Realtime connection established');
+      this.isConnected = true;
       this.emit('connected');
     });
 
@@ -160,38 +205,158 @@ export class InstagramClient extends EventEmitter {
       this.isConnected = false;
       this.emit('disconnected');
     });
+
+    // Typing indicators
+    this.ig.realtime.on('typing', (data) => {
+      this.emit('typing', data);
+    });
+
+    // Presence updates
+    this.ig.realtime.on('presence', (data) => {
+      this.emit('presence', data);
+    });
+
+    // Message status updates
+    this.ig.realtime.on('messageStatus', (data) => {
+      this.emit('messageStatus', data);
+    });
   }
 
-  async processMessage(message, eventData) {
-    // Get sender info
-    let senderInfo = null;
-    if (eventData.thread?.users) {
-      senderInfo = eventData.thread.users.find(u => u.pk?.toString() === message.user_id?.toString());
-    }
+  async handleMessage(message, eventData) {
+    try {
+      // Get or create chat
+      const threadId = eventData.thread?.thread_id || message.thread_id;
+      let chat = this.cache.chats.get(threadId);
+      
+      if (!chat) {
+        chat = new Chat(this, threadId, eventData.thread || { thread_id: threadId });
+        this.cache.chats.set(threadId, chat);
+      } else {
+        chat._patch(eventData.thread || {});
+      }
 
-    // If not found in thread, fetch user info
-    if (!senderInfo && message.user_id) {
-      try {
-        senderInfo = await this.ig.user.info(message.user_id);
-      } catch (error) {
-        logger.debug('Could not fetch user info:', error.message);
+      // Create message instance
+      const messageInstance = new Message(this, threadId, message);
+      chat.messages.set(messageInstance.id, messageInstance);
+      this.cache.messages.set(messageInstance.id, messageInstance);
+
+      // Get or create user
+      const userId = message.user_id;
+      let user = this.cache.users.get(userId);
+      
+      if (!user) {
+        // Try to get user from thread data first
+        let userData = null;
+        if (eventData.thread?.users) {
+          userData = eventData.thread.users.find(u => u.pk?.toString() === userId?.toString());
+        }
+        
+        // If not found, fetch user info
+        if (!userData) {
+          try {
+            userData = await this.ig.user.info(userId);
+          } catch (error) {
+            logger.debug('Could not fetch user info:', error.message);
+            userData = { pk: userId, username: `user_${userId}` };
+          }
+        }
+        
+        user = new User(this, userData);
+        this.cache.users.set(userId, user);
+      }
+
+      // Emit events
+      this.emit('messageCreate', messageInstance);
+      
+      // Check if it's a new follower (real-time detection)
+      if (!this.cache.users.has(userId)) {
+        this.emit('newFollower', user);
+      }
+
+    } catch (error) {
+      logger.error('❌ Error handling message:', error.message);
+    }
+  }
+
+  handleRealtimeReceive(topic, payload) {
+    this.emit('rawRealtime', topic, payload);
+    
+    if (topic.id === '146') {
+      const rawMessages = JSON.parse(payload);
+      rawMessages.forEach(async (rawMessage) => {
+        rawMessage.data.forEach((data) => {
+          switch (data.op) {
+            case 'replace': {
+              this.handleRealtimeReplace(data);
+              break;
+            }
+            case 'add': {
+              this.handleRealtimeAdd(data);
+              break;
+            }
+            case 'remove': {
+              this.handleRealtimeRemove(data);
+              break;
+            }
+          }
+        });
+      });
+    }
+  }
+
+  handleRealtimeReplace(data) {
+    // Handle thread updates, user updates, etc.
+    const isInboxThreadPath = /\/direct_v2\/inbox\/threads\/(\d+)/.test(data.path);
+    if (isInboxThreadPath) {
+      const [threadId] = data.path.match(/\/direct_v2\/inbox\/threads\/(\d+)/).slice(1);
+      const chat = this.cache.chats.get(threadId);
+      if (chat) {
+        const oldChat = Object.assign(Object.create(chat), chat);
+        chat._patch(JSON.parse(data.value));
+        
+        // Emit specific events
+        if (oldChat.name !== chat.name) {
+          this.emit('chatNameUpdate', chat, oldChat.name, chat.name);
+        }
+        
+        if (oldChat.users.size < chat.users.size) {
+          const userAdded = chat.users.find((u) => !oldChat.users.has(u.id));
+          if (userAdded) this.emit('chatUserAdd', chat, userAdded);
+        } else if (oldChat.users.size > chat.users.size) {
+          const userRemoved = oldChat.users.find((u) => !chat.users.has(u.id));
+          if (userRemoved) this.emit('chatUserRemove', chat, userRemoved);
+        }
       }
     }
+  }
 
-    return {
-      id: message.item_id,
-      text: message.text || '',
-      senderId: message.user_id,
-      senderUsername: senderInfo?.username || `user_${message.user_id}`,
-      senderFullName: senderInfo?.full_name || null,
-      senderProfilePic: senderInfo?.profile_pic_url || senderInfo?.hd_profile_pic_url_info?.url || null,
-      timestamp: new Date(parseInt(message.timestamp, 10) / 1000),
-      threadId: eventData.thread?.thread_id || message.thread_id || 'unknown_thread',
-      threadTitle: eventData.thread?.thread_title || 'Direct Message',
-      type: message.item_type || 'text',
-      isGroup: eventData.thread?.is_group || false,
-      raw: message
-    };
+  handleRealtimeAdd(data) {
+    // Handle new messages, new followers, etc.
+    const isMessagePath = /\/direct_v2\/threads\/(\d+)\/items\/(\d+)/.test(data.path);
+    if (isMessagePath) {
+      const [threadId] = data.path.match(/\/direct_v2\/threads\/(\d+)\/items\/(\d+)/).slice(1);
+      this.fetchChat(threadId).then((chat) => {
+        const messagePayload = JSON.parse(data.value);
+        if (messagePayload.item_type === 'action_log' || messagePayload.item_type === 'video_call_event') return;
+        
+        const message = new Message(this, threadId, messagePayload);
+        chat.messages.set(message.id, message);
+        this.emit('messageCreate', message);
+      });
+    }
+  }
+
+  handleRealtimeRemove(data) {
+    // Handle message deletions, user removals, etc.
+    const isMessagePath = /\/direct_v2\/threads\/(\d+)\/items\/(\d+)/.test(data.path);
+    if (isMessagePath) {
+      const [threadId] = data.path.match(/\/direct_v2\/threads\/(\d+)\/items\/(\d+)/).slice(1);
+      this.fetchChat(threadId).then((chat) => {
+        const messageId = data.value;
+        const existing = chat.messages.get(messageId);
+        if (existing) this.emit('messageDelete', existing);
+      });
+    }
   }
 
   isNewMessageById(messageId) {
@@ -211,6 +376,46 @@ export class InstagramClient extends EventEmitter {
     return true;
   }
 
+  // Create or patch user in cache
+  _patchOrCreateUser(userID, userPayload) {
+    if (this.cache.users.has(userID)) {
+      this.cache.users.get(userID)._patch(userPayload);
+    } else {
+      this.cache.users.set(userID, new User(this, userPayload));
+    }
+    return this.cache.users.get(userID);
+  }
+
+  // Fetch chat and cache it
+  async fetchChat(chatID, force = false) {
+    if (!this.cache.chats.has(chatID) || force) {
+      const { thread: chatPayload } = await this.ig.feed.directThread({ thread_id: chatID }).request();
+      const chat = new Chat(this, chatID, chatPayload);
+      this.cache.chats.set(chatID, chat);
+    }
+    return this.cache.chats.get(chatID);
+  }
+
+  // Fetch user and cache it
+  async fetchUser(query, force = false) {
+    const userID = /^\d+$/.test(query) ? query : await this.ig.user.getIdByUsername(query);
+    
+    if (!this.cache.users.has(userID) || force) {
+      const userPayload = await this.ig.user.info(userID);
+      const user = new User(this, userPayload);
+      this.cache.users.set(userID, user);
+    }
+    return this.cache.users.get(userID);
+  }
+
+  // Create chat between users
+  async createChat(userIDs) {
+    const threadPayload = await this.ig.direct.createGroupThread(userIDs);
+    const chat = new Chat(this, threadPayload.thread_id, threadPayload);
+    this.cache.chats.set(chat.id, chat);
+    return chat;
+  }
+
   async sendMessage(threadId, text) {
     try {
       await this.ig.entity.directThread(threadId).broadcastText(text);
@@ -221,9 +426,13 @@ export class InstagramClient extends EventEmitter {
     }
   }
 
-  async sendPhoto(threadId, photoBuffer) {
+  async sendPhoto(threadId, attachment) {
     try {
-      await this.ig.entity.directThread(threadId).broadcastPhoto({ file: photoBuffer });
+      if (!(attachment instanceof Attachment)) {
+        attachment = new Attachment(attachment);
+      }
+      await attachment._verify();
+      await this.ig.entity.directThread(threadId).broadcastPhoto({ file: attachment.file });
       return true;
     } catch (error) {
       logger.error(`❌ Error sending photo to thread ${threadId}:`, error.message);
@@ -357,10 +566,19 @@ export class InstagramClient extends EventEmitter {
         await this.ig.realtime.disconnect();
       }
       this.isConnected = false;
+      this.ready = false;
       this.emit('disconnected');
       logger.info('✅ Instagram client disconnected');
     } catch (error) {
       logger.error('❌ Error disconnecting:', error.message);
     }
+  }
+
+  toJSON() {
+    return {
+      ready: this.ready,
+      isConnected: this.isConnected,
+      id: this.user?.id
+    };
   }
 }
