@@ -1,7 +1,7 @@
 import getUrls from 'get-urls';
 import { Collection } from '@discordjs/collection';
 
-import Util from '../utils/Util.js';
+import Util from './Util.js';
 import Message from './Message.js';
 import Attachment from './Attachment.js';
 
