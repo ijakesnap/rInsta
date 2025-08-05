@@ -2,7 +2,7 @@ import { InstagramBot } from './core/bot.js';
 import { TelegramBridge } from './telegram/bridge.js';
 import { ModuleManager } from './core/module-manager.js';
 import { MessageHandler } from './core/message-handler.js';
-import { logger } from './utils/utils.js'; 
+import { logger } from './utils/logger.js';
 import { config } from './config.js';
 import { connectDb } from './utils/db.js';
 
@@ -17,52 +17,50 @@ class HyperInsta {
     try {
       this.showStartupBanner();
 
-
-      console.log('🗄️ Connecting to MongoDB...');
+      logger.info('🗄️ Connecting to MongoDB...');
       await connectDb();
-      console.log('✅ MongoDB connected');
+      logger.info('✅ MongoDB connected');
 
-      console.log('📱 Connecting to Instagram...');
+      logger.info('📱 Connecting to Instagram...');
       await this.instagramBot.login();
-      console.log('✅ Instagram connected');
+      logger.info('✅ Instagram connected');
 
       if (this.telegramBridge) {
-        console.log('📨 Initializing Telegram...');
-        await this.telegramBridge.initialize();
-        console.log('✅ Telegram connected');
+        logger.info('📨 Initializing Telegram bridge...');
+        await this.telegramBridge.initialize(this.instagramBot);
+        logger.info('✅ Telegram bridge connected');
       }
 
-      console.log('🔌 Loading modules...');
+      logger.info('🔌 Loading modules...');
       const moduleManager = new ModuleManager(this.instagramBot);
       await moduleManager.loadModules();
-      console.log('✅ Modules loaded');
+      logger.info('✅ Modules loaded');
 
-      console.log('📨 Initializing message handler...');
+      logger.info('📨 Initializing message handler...');
       const messageHandler = new MessageHandler(this.instagramBot, moduleManager, this.telegramBridge);
       this.instagramBot.onMessage((message) => messageHandler.handleMessage(message));
-      console.log('✅ Message handler connected');
+      logger.info('✅ Message handler connected');
 
       await this.instagramBot.startMessageRequestsMonitor(config.messageRequestInterval || 300000);
-      console.log('🕒 Message request monitor started');
+      logger.info('🕒 Message request monitor started');
 
-      console.log('✅ Bot is now LIVE and ready!');
+      logger.info('✅ Bot is now LIVE and ready!');
       this.showLiveStatus();
 
     } catch (error) {
-      console.error(`❌ Startup failed: ${error.message}`);
-      console.debug(error.stack);
+      logger.error(`❌ Startup failed: ${error.message}`);
+      logger.debug('Error stack:', error.stack);
       // Attempt cleanup
       if (this.instagramBot) {
         try {
           await this.instagramBot.disconnect();
         } catch (disconnectError) {
-          console.error('❌ Error during cleanup disconnect:', disconnectError.message);
+          logger.error('❌ Error during cleanup disconnect:', disconnectError.message);
         }
       }
       process.exit(1);
     }
   }
-
 
   showStartupBanner() {
     console.log(`
@@ -102,13 +100,21 @@ class HyperInsta {
     await this.initialize();
 
     process.on('SIGINT', async () => {
-      console.log('\n🛑 Shutting down gracefully...');
+      logger.info('\n🛑 Shutting down gracefully...');
+      
+      if (this.telegramBridge) {
+        await this.telegramBridge.shutdown();
+      }
+      
       await this.instagramBot.disconnect();
-      console.log('✅ Hyper Insta stopped');
+      logger.info('✅ Hyper Insta stopped');
       process.exit(0);
     });
   }
 }
 
 const bot = new HyperInsta();
-bot.start().catch(console.error);
+bot.start().catch((error) => {
+  logger.error('❌ Fatal error:', error.message);
+  process.exit(1);
+});

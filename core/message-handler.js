@@ -21,7 +21,7 @@ export class MessageHandler {
       }
 
       // Forward to Telegram if enabled
-      if (this.telegramBridge?.enabled && config.telegram.enabled) {
+      if (this.telegramBridge?.enabled && config.telegram?.enabled) {
         await this.telegramBridge.handleInstagramMessage(processedMessage);
       }
 
@@ -32,7 +32,7 @@ export class MessageHandler {
 
   async handleCommand(message) {
     try {
-      const commandText = message.content.slice(this.commandPrefix.length).trim();
+      const commandText = message.text.slice(this.commandPrefix.length).trim();
       const [commandName, ...args] = commandText.split(' ');
       
       if (!commandName) return;
@@ -44,19 +44,19 @@ export class MessageHandler {
       }
 
       // Admin check
-      if (command.adminOnly && !this.isAdmin(message.author?.username)) {
+      if (command.adminOnly && !this.isAdmin(message.senderUsername)) {
         await this.sendReply(message, '❌ This command requires admin privileges');
         return;
       }
 
       // Log command execution
-      logger.info(`Command executed: .${commandName} by @${message.author?.username || 'unknown'}`);
+      logger.info(`Command executed: .${commandName} by @${message.senderUsername || 'unknown'}`);
       
       // Execute command with proper message format
       const commandMessage = {
-        threadId: message.chatID,
-        senderUsername: message.author?.username,
-        text: message.content,
+        threadId: message.threadId,
+        senderUsername: message.senderUsername,
+        text: message.text,
         ...message
       };
       
@@ -70,7 +70,7 @@ export class MessageHandler {
 
   async sendReply(message, text) {
     try {
-      await this.instagramClient.sendMessage(message.chatID, text);
+      await this.instagramClient.sendMessage(message.threadId, text);
     } catch (error) {
       logger.error('Error sending reply:', error.message);
     }
