@@ -475,6 +475,44 @@ async loadCookiesFromJson(path = './cookies.json') {
     }
   }
 
+async sendPhoto(threadId, photoPath, caption = '') {
+    if (!threadId || !photoPath) {
+        this.log('WARN', '⚠️ sendPhoto called with missing threadId or photoPath');
+        throw new Error('Thread ID and photo path are required');
+    }
+
+    try {
+        await this.ig.entity.directThread(threadId).broadcastPhoto({
+            file: await fs.readFile(photoPath),
+            caption,
+        });
+        this.log('INFO', `📤 Photo sent successfully to thread ${threadId}`);
+        return true;
+    } catch (error) {
+        this.log('ERROR', `❌ Error sending photo to thread ${threadId}:`, error.message);
+        throw error;
+    }
+}
+
+async sendVideo(threadId, videoPath, caption = '') {
+    if (!threadId || !videoPath) {
+        this.log('WARN', '⚠️ sendVideo called with missing threadId or videoPath');
+        throw new Error('Thread ID and video path are required');
+    }
+
+    try {
+        await this.ig.entity.directThread(threadId).broadcastVideo({
+            video: await fs.readFile(videoPath),
+            caption,
+        });
+        this.log('INFO', `📤 Video sent successfully to thread ${threadId}`);
+        return true;
+    } catch (error) {
+        this.log('ERROR', `❌ Error sending video to thread ${threadId}:`, error.message);
+        throw error;
+    }
+}
+
   // --- Methods for Missing Features from Example ---
 
   // Subscribe to live comments on a specific broadcast
