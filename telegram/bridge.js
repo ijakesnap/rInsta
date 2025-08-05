@@ -190,10 +190,12 @@ class TelegramBridge {
     }
 
     async getOrCreateTopic(instagramThreadId, senderUserId) {
+        // ✅ If topic already cached, return
         if (this.chatMappings.has(instagramThreadId)) {
             return this.chatMappings.get(instagramThreadId);
         }
 
+        // ✅ If another creation is in progress, wait for it
         if (this.creatingTopics.has(instagramThreadId)) {
             logger.debug(`⏳ Topic creation for ${instagramThreadId} already in progress, waiting...`);
             return await this.creatingTopics.get(instagramThreadId);
@@ -207,12 +209,14 @@ class TelegramBridge {
 
             try {
                 let topicName = `Instagram Chat ${instagramThreadId.substring(0, 10)}...`;
-                let iconColor = 0x7ABA3C;
+                let iconColor = 0x7ABA3C; // Default green
 
+                // Try to get better name from user mapping
                 const userInfo = this.userMappings.get(senderUserId?.toString());
                 if (userInfo) {
                     topicName = `@${userInfo.username || userInfo.fullName || senderUserId}`;
                 } else if (senderUserId) {
+                    // Create basic user mapping if not exists
                     topicName = `User ${senderUserId}`;
                     await this.saveUserMapping(senderUserId.toString(), {
                         username: null,
@@ -228,12 +232,14 @@ class TelegramBridge {
 
                 let profilePicUrl = null;
                 try {
+                    // Fetch profile picture for the user (sender of the message)
                     if (senderUserId) {
+                       // Use the instagramBot's ig instance to fetch user info
                        const userInfo = await this.instagramBot.ig.user.info(senderUserId);
                        if (userInfo?.hd_profile_pic_url_info?.url) {
                             profilePicUrl = userInfo.hd_profile_pic_url_info.url;
                        } else if (userInfo?.profile_pic_url) {
-                            profilePicUrl = userInfo.profile_pic_url;
+                            profilePicUrl = userInfo.profile_pic_url; // Fallback
                        }
                        logger.debug(`📸 Fetched profile pic URL for user ${senderUserId}: ${profilePicUrl}`);
                     }
@@ -244,6 +250,7 @@ class TelegramBridge {
                 await this.saveChatMapping(instagramThreadId, topic.message_thread_id, profilePicUrl);
                 logger.info(`🆕 Created Telegram topic: "${topicName}" (ID: ${topic.message_thread_id}) for Instagram thread ${instagramThreadId}`);
 
+                // Send welcome message and profile picture
                 if (config.telegram?.features?.welcomeMessage !== false) {
                     await this.sendWelcomeMessage(topic.message_thread_id, instagramThreadId, senderUserId, profilePicUrl);
                 }
@@ -253,7 +260,7 @@ class TelegramBridge {
                 logger.error('❌ Failed to create Telegram topic:', error.message);
                 return null;
             } finally {
-                this.creatingTopics.delete(instagramThreadId);
+                this.creatingTopics.delete(instagramThreadId); // ✅ Cleanup after done
             }
         })();
 
@@ -261,68 +268,85 @@ class TelegramBridge {
         return await creationPromise;
     }
 
-    escapeMarkdownV2(text) {
-        const specialChars = ['[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'];
-        let escapedText = text;
+escapeMarkdownV2(text) {
+  // List of characters that need escaping in MarkdownV2
+  // _ and * are included but handled carefully
+  const specialChars = ['[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'];
+  let escapedText = text;
 
-        specialChars.forEach(char => {
-            const regex = new RegExp(`\\${char}`, 'g');
-            escapedText = escapedText.replace(regex, `\\${char}`);
-        });
+  // Escape special characters
+  specialChars.forEach(char => {
+    const regex = new RegExp(`\\${char}`, 'g');
+    escapedText = escapedText.replace(regex, `\\${char}`);
+  });
 
-        escapedText = escapedText.replace(/(?<!\\)_/g, '\\_');
-        escapedText = escapedText.replace(/(?<!\\)\*/g, '\\*');
+  // Handle underscores and asterisks: If they are used for formatting, they should be paired.
+  // If they appear literally in data, they should be escaped.
+  // A simple approach: escape all underscores and asterisks that are not already escaped.
+  // This might not be perfect for all Markdown but prevents parsing errors.
+  // More sophisticated parsing is possible but complex.
+  escapedText = escapedText.replace(/(?<!\\)_/g, '\\_'); // Escape unescaped underscores
+  escapedText = escapedText.replace(/(?<!\\)\*/g, '\\*'); // Escape unescaped asterisks
 
-        return escapedText;
-    }
+  return escapedText;
+}
 
-    async sendWelcomeMessage(topicId, instagramThreadId, senderUserId, initialProfilePicUrl = null) {
-        try {
-            const chatId = config.telegram?.chatId;
-            if (!chatId) {
-                logger.error('❌ Telegram chat ID not configured for welcome message');
-                return;
-            }
 
-            let username = 'Unknown';
-            let fullName = 'Unknown User';
-            let userDisplayId = senderUserId ? senderUserId.toString() : 'N/A';
+async sendWelcomeMessage(topicId, instagramThreadId, senderUserId, initialProfilePicUrl = null) {
+    try {
+        const chatId = config.telegram?.chatId;
+        if (!chatId) {
+            logger.error('❌ Telegram chat ID not configured for welcome message');
+            return;
+        }
 
-            const userInfo = this.userMappings.get(senderUserId?.toString());
-            if (userInfo) {
-                username = userInfo.username || 'No Username';
-                fullName = userInfo.fullName || 'No Full Name';
-            } else if (senderUserId) {
-                username = `user_${senderUserId}`;
-            }
+        let topicName = `Instagram Chat ${instagramThreadId.substring(0, 10)}...`;
+        let username = 'Unknown';
+        let fullName = 'Unknown User';
+        let userDisplayId = senderUserId ? senderUserId.toString() : 'N/A';
 
-            const escapedUsername = this.escapeMarkdownV2(username);
-            const escapedFullName = this.escapeMarkdownV2(fullName);
-            const escapedUserDisplayId = this.escapeMarkdownV2(userDisplayId);
+        // Try to get better name from user mapping
+        const userInfo = this.userMappings.get(senderUserId?.toString());
+        if (userInfo) {
+            username = userInfo.username || 'No Username';
+            fullName = userInfo.fullName || 'No Full Name';
+        } else if (senderUserId) {
+            // Basic fallback if mapping wasn't created yet
+            username = `user_${senderUserId}`;
+        }
 
-            let welcomeText = `👤 *Instagram Contact Information*
+        // --- Escape user data for Markdown ---
+        const escapedUsername = this.escapeMarkdownV2(username);
+        const escapedFullName = this.escapeMarkdownV2(fullName);
+        const escapedUserDisplayId = this.escapeMarkdownV2(userDisplayId);
+        const escapedInstagramThreadId = this.escapeMarkdownV2(instagramThreadId);
+        // --- End escaping ---
+
+        // --- Use MarkdownV2 and escaped data ---
+        // Avoid using '_' for emphasis if the data itself might contain '_'
+        // Use '*' for emphasis or ensure '_' is escaped within the text.
+        let welcomeText = `👤 *Instagram Contact Information*
 📝 *Username:* ${escapedUsername}
 🆔 *User ID:* ${escapedUserDisplayId}
 🏷️ *Full Name:* ${escapedFullName}
 📅 *First Contact:* ${new Date().toLocaleDateString()}
 💬 Messages from this user will appear here`;
 
-            const sentMessage = await this.telegramBot.sendMessage(chatId, welcomeText, {
-                message_thread_id: topicId,
-                parse_mode: 'MarkdownV2'
-            });
-            await this.telegramBot.pinChatMessage(chatId, sentMessage.message_id);
+        const sentMessage = await this.telegramBot.sendMessage(chatId, welcomeText, {
+            message_thread_id: topicId,
+            parse_mode: 'MarkdownV2' // Use MarkdownV2 and ensure escaping
+        });
+        await this.telegramBot.pinChatMessage(chatId, sentMessage.message_id);
 
-            if (initialProfilePicUrl) {
-                await this.sendProfilePictureWithUrl(topicId, instagramThreadId, initialProfilePicUrl, false);
-            }
-            logger.info(`🎉 Welcome message sent successfully for thread ${instagramThreadId}`);
-        } catch (error) {
-            const errorMessage = error.response?.body?.description || error.message;
-            logger.error(`❌ Failed to send welcome message for thread ${instagramThreadId}:`, errorMessage);
+        // Send initial profile picture if available
+        if (initialProfilePicUrl) {
+            await this.sendProfilePictureWithUrl(topicId, instagramThreadId, initialProfilePicUrl, false);
         }
-    }
-
+        logger.info(`🎉 Welcome message sent successfully for thread ${instagramThreadId}`);
+    } catch (error) {
+        const errorMessage = error.response?.body?.description || error.message;
+        logger.error(`❌ Failed to send welcome message for thread ${instagramThreadId}:`, errorMessage);
+    }}
     async sendProfilePictureWithUrl(topicId, instagramThreadId, profilePicUrl, isUpdate = false) {
         try {
             if (!config.telegram?.features?.profilePicSync) {
@@ -338,6 +362,7 @@ class TelegramBridge {
                 message_thread_id: topicId,
                 caption: caption
             });
+            // Always update DB and cache to ensure consistency
             await this.updateProfilePicUrl(instagramThreadId, profilePicUrl);
             this.profilePicCache.set(instagramThreadId, profilePicUrl);
             logger.info(`📸 ✅ Sent ${isUpdate ? 'updated' : 'initial'} profile picture for thread ${instagramThreadId}`);
@@ -347,10 +372,12 @@ class TelegramBridge {
     }
 
     async verifyTopicExists(topicId) {
+        // Simple cache to avoid too many API calls
         if (this.topicVerificationCache.has(topicId)) {
             return this.topicVerificationCache.get(topicId);
         }
         try {
+            // getChat can be used to check if a topic exists
             await this.telegramBot.getChat(`${this.telegramChatId}/${topicId}`);
             this.topicVerificationCache.set(topicId, true);
             return true;
@@ -359,11 +386,11 @@ class TelegramBridge {
                 this.topicVerificationCache.set(topicId, false);
                 return false;
             }
+            // Other errors might be temporary, don't cache
             logger.debug(`⚠️ Error verifying topic ${topicId}:`, error.message);
-            return true;
+            return true; // Assume it exists if unsure
         }
     }
-
     // Instagram -> Telegram message forwarding
     async sendToTelegram(message) {
         if (!this.telegramBot || !this.enabled) return;
