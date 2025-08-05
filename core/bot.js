@@ -487,7 +487,7 @@ async loadCookiesFromJson(path = './cookies.json') {
       this.log('ERROR', `❌ Error sending photo to thread ${threadId}: ${error.message}`);
       throw error;
     }
-  }
+  } 
 
   async sendVideo(threadId, videoPath, caption = '') {
     try {
