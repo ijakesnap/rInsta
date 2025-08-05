@@ -1,4 +1,3 @@
-// telegram/bridge.js
 import TelegramBot from 'node-telegram-bot-api';
 import fs from 'fs-extra';
 import path from 'path';
