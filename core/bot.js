@@ -9,6 +9,44 @@ import { ModuleManager } from './module-manager.js';
 import { MessageHandler } from './message-handler.js';
 import { config } from '../config.js';
 
+// Add rate limiting and session management
+class RateLimiter {
+  constructor() {
+    this.requests = new Map();
+    this.limits = {
+      message: { count: 0, max: 60, window: 60000 }, // 60 messages per minute
+      media: { count: 0, max: 10, window: 60000 },   // 10 media per minute
+      follow: { count: 0, max: 20, window: 3600000 } // 20 follows per hour
+    };
+  }
+
+  canMakeRequest(type) {
+    const limit = this.limits[type];
+    if (!limit) return true;
+
+    const now = Date.now();
+    if (now - (limit.lastReset || 0) > limit.window) {
+      limit.count = 0;
+      limit.lastReset = now;
+    }
+
+    return limit.count < limit.max;
+  }
+
+  recordRequest(type) {
+    const limit = this.limits[type];
+    if (limit) {
+      limit.count++;
+    }
+  }
+
+  getWaitTime(type) {
+    const limit = this.limits[type];
+    if (!limit) return 0;
+    return limit.window - (Date.now() - (limit.lastReset || 0));
+  }
+}
+
 class InstagramBot {
   constructor() {
     this.ig = withRealtime(new IgApiClient());
@@ -18,6 +56,16 @@ class InstagramBot {
     // Improved message deduplication using IDs
     this.processedMessageIds = new Set(); 
     this.maxProcessedMessageIds = 1000; 
+    
+    // Add session management
+    this.rateLimiter = new RateLimiter();
+    this.sessionValid = false;
+    this.lastSessionCheck = 0;
+    this.sessionCheckInterval = 300000; // Check every 5 minutes
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = 3;
+    this.mediaQueue = [];
+    this.processingMedia = false;
   }
 
   log(level, message, ...args) {
@@ -127,6 +175,12 @@ async login() {
 
       this.isRunning = true;
       this.log('INFO', '🚀 Instagram bot is now running and listening for messages');
+      this.sessionValid = true;
+      this.lastSessionCheck = Date.now();
+      this.reconnectAttempts = 0;
+      
+      // Start session monitoring
+      this.startSessionMonitoring();
       // --- End registration and connection ---
     } else {
         throw new Error('No valid login method succeeded (session or cookies).');
@@ -438,12 +492,28 @@ async loadCookiesFromJson(path = './cookies.json') {
         throw new Error('Thread ID and text are required');
     }
 
+    // Check rate limiting
+    if (!this.rateLimiter.canMakeRequest('message')) {
+      const waitTime = this.rateLimiter.getWaitTime('message');
+      this.log('WARN', `⏳ Rate limit reached for messages, waiting ${Math.ceil(waitTime/1000)}s`);
+      await this.delay(Math.min(waitTime, 10000)); // Max 10s wait
+    }
+
+    // Check session validity
+    await this.ensureValidSession();
+
     try {
       // Perform the send action
       await this.ig.entity.directThread(threadId).broadcastText(text);
+      this.rateLimiter.recordRequest('message');
       this.log('INFO', `📤 Message sent successfully to thread ${threadId}: "${text}"`);
       return true;
     } catch (error) {
+      if (this.isSessionError(error)) {
+        this.log('ERROR', '🔐 Session error detected, attempting recovery...');
+        await this.handleSessionError();
+        throw new Error('Session expired, please retry');
+      }
       this.log('ERROR', `❌ Error sending message to thread ${threadId}:`, error.message);
       // Re-throw to allow caller to handle send failures
       throw error; 
@@ -457,9 +527,22 @@ async loadCookiesFromJson(path = './cookies.json') {
       throw new Error('Thread ID and photo path are required');
     }
 
+    // Check rate limiting for media
+    if (!this.rateLimiter.canMakeRequest('media')) {
+      const waitTime = this.rateLimiter.getWaitTime('media');
+      this.log('WARN', `⏳ Rate limit reached for media, waiting ${Math.ceil(waitTime/1000)}s`);
+      await this.delay(Math.min(waitTime, 30000)); // Max 30s wait for media
+    }
+
+    // Check session validity
+    await this.ensureValidSession();
+
     try {
       // Check if file exists
       await fs.access(photoPath);
+      
+      // Add delay before media upload to avoid spam detection
+      await this.delay(2000 + Math.random() * 3000); // 2-5 second delay
       
       const thread = this.ig.entity.directThread(threadId);
       await thread.broadcastPhoto({
@@ -467,9 +550,15 @@ async loadCookiesFromJson(path = './cookies.json') {
         text: caption
       });
       
+      this.rateLimiter.recordRequest('media');
       this.log('INFO', `📷 Photo sent successfully to thread ${threadId}${caption ? ` with caption: "${caption}"` : ''}`);
       return true;
     } catch (error) {
+      if (this.isSessionError(error)) {
+        this.log('ERROR', '🔐 Session error detected during photo upload, attempting recovery...');
+        await this.handleSessionError();
+        throw new Error('Session expired during photo upload, please retry');
+      }
       this.log('ERROR', `❌ Error sending photo to thread ${threadId}:`, error.message);
       throw error;
     }
@@ -481,9 +570,22 @@ async loadCookiesFromJson(path = './cookies.json') {
       throw new Error('Thread ID and video path are required');
     }
 
+    // Check rate limiting for media
+    if (!this.rateLimiter.canMakeRequest('media')) {
+      const waitTime = this.rateLimiter.getWaitTime('media');
+      this.log('WARN', `⏳ Rate limit reached for media, waiting ${Math.ceil(waitTime/1000)}s`);
+      await this.delay(Math.min(waitTime, 30000));
+    }
+
+    // Check session validity
+    await this.ensureValidSession();
+
     try {
       // Check if file exists
       await fs.access(videoPath);
+      
+      // Add delay before media upload
+      await this.delay(3000 + Math.random() * 5000); // 3-8 second delay for videos
       
       const thread = this.ig.entity.directThread(threadId);
       await thread.broadcastVideo({
@@ -491,9 +593,15 @@ async loadCookiesFromJson(path = './cookies.json') {
         text: caption
       });
       
+      this.rateLimiter.recordRequest('media');
       this.log('INFO', `🎥 Video sent successfully to thread ${threadId}${caption ? ` with caption: "${caption}"` : ''}`);
       return true;
     } catch (error) {
+      if (this.isSessionError(error)) {
+        this.log('ERROR', '🔐 Session error detected during video upload, attempting recovery...');
+        await this.handleSessionError();
+        throw new Error('Session expired during video upload, please retry');
+      }
       this.log('ERROR', `❌ Error sending video to thread ${threadId}:`, error.message);
       throw error;
     }
@@ -505,9 +613,22 @@ async loadCookiesFromJson(path = './cookies.json') {
       throw new Error('Thread ID and voice path are required');
     }
 
+    // Check rate limiting for media
+    if (!this.rateLimiter.canMakeRequest('media')) {
+      const waitTime = this.rateLimiter.getWaitTime('media');
+      this.log('WARN', `⏳ Rate limit reached for media, waiting ${Math.ceil(waitTime/1000)}s`);
+      await this.delay(Math.min(waitTime, 30000));
+    }
+
+    // Check session validity
+    await this.ensureValidSession();
+
     try {
       // Check if file exists
       await fs.access(voicePath);
+      
+      // Add delay before media upload
+      await this.delay(2000 + Math.random() * 3000);
       
       const thread = this.ig.entity.directThread(threadId);
       
@@ -518,9 +639,15 @@ async loadCookiesFromJson(path = './cookies.json') {
         sampling_freq: 0, // Optional sampling frequency
       });
       
+      this.rateLimiter.recordRequest('media');
       this.log('INFO', `🎤 Voice message sent successfully to thread ${threadId}`);
       return true;
     } catch (error) {
+      if (this.isSessionError(error)) {
+        this.log('ERROR', '🔐 Session error detected during voice upload, attempting recovery...');
+        await this.handleSessionError();
+        throw new Error('Session expired during voice upload, please retry');
+      }
       this.log('ERROR', `❌ Error sending voice message to thread ${threadId}:`, error.message);
       // Fallback: try sending as regular audio if voice fails
       try {
@@ -799,6 +926,90 @@ async function main() {
   }
 }
 
+  // Add session management methods
+  startSessionMonitoring() {
+    setInterval(async () => {
+      if (this.isRunning) {
+        await this.checkSessionHealth();
+      }
+    }, this.sessionCheckInterval);
+    
+    this.log('INFO', '🔍 Session monitoring started');
+  }
+
+  async checkSessionHealth() {
+    try {
+      // Simple health check - get current user info
+      await this.ig.account.currentUser();
+      this.sessionValid = true;
+      this.lastSessionCheck = Date.now();
+      this.reconnectAttempts = 0;
+    } catch (error) {
+      this.log('WARN', '⚠️ Session health check failed:', error.message);
+      this.sessionValid = false;
+      await this.handleSessionError();
+    }
+  }
+
+  async ensureValidSession() {
+    const now = Date.now();
+    
+    // Check if we need to validate session
+    if (!this.sessionValid || (now - this.lastSessionCheck) > this.sessionCheckInterval) {
+      await this.checkSessionHealth();
+    }
+    
+    if (!this.sessionValid) {
+      throw new Error('Instagram session is invalid');
+    }
+  }
+
+  isSessionError(error) {
+    const errorMessage = error.message?.toLowerCase() || '';
+    const errorCode = error.response?.statusCode || error.statusCode;
+    
+    return (
+      errorMessage.includes('login_required') ||
+      errorMessage.includes('unauthorized') ||
+      errorMessage.includes('forbidden') ||
+      errorCode === 401 ||
+      errorCode === 403
+    );
+  }
+
+  async handleSessionError() {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      this.log('ERROR', '❌ Max reconnection attempts reached. Manual intervention required.');
+      this.isRunning = false;
+      return;
+    }
+
+    this.reconnectAttempts++;
+    this.sessionValid = false;
+    
+    this.log('WARN', `🔄 Attempting session recovery (${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
+    
+    try {
+      // Wait before attempting recovery
+      await this.delay(5000 * this.reconnectAttempts);
+      
+      // Try to re-login using existing session/cookies
+      await this.login();
+      
+      this.log('INFO', '✅ Session recovery successful');
+    } catch (error) {
+      this.log('ERROR', `❌ Session recovery failed (attempt ${this.reconnectAttempts}):`, error.message);
+      
+      if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+        this.log('ERROR', '❌ All recovery attempts failed. Bot stopping.');
+        this.isRunning = false;
+      }
+    }
+  }
+
+  delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
 // Run main only if this file is executed directly
 if (import.meta.url === `file://${process.argv[1]}`) {
     main().catch((error) => {

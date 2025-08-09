@@ -22,6 +22,8 @@ class TelegramBridge {
         this.topicVerificationCache = new Map();
         this.enabled = false;
         this.filters = new Set();
+        this.mediaQueue = [];
+        this.processingMedia = false;
     }
 
     async initialize(instagramBotInstance) {
@@ -770,6 +772,61 @@ async sendWelcomeMessage(topicId, instagramThreadId, senderUserId, initialProfil
         try {
             await this.setReaction(msg.chat.id, msg.message_id, '🔄');
 
+            // Add to media queue to prevent overwhelming Instagram
+            return await this.queueMediaUpload(msg, mediaType, instagramThreadId);
+        } catch (error) {
+            logger.error(`❌ Failed to queue Telegram ${mediaType}:`, error.message);
+            await this.setReaction(msg.chat.id, msg.message_id, '❌');
+        }
+    }
+
+    async queueMediaUpload(msg, mediaType, instagramThreadId) {
+        return new Promise((resolve, reject) => {
+            this.mediaQueue.push({
+                msg,
+                mediaType,
+                instagramThreadId,
+                resolve,
+                reject,
+                timestamp: Date.now()
+            });
+
+            // Start processing if not already running
+            if (!this.processingMedia) {
+                this.processMediaQueue();
+            }
+        });
+    }
+
+    async processMediaQueue() {
+        if (this.processingMedia || this.mediaQueue.length === 0) return;
+        
+        this.processingMedia = true;
+        logger.info(`📤 Processing media queue: ${this.mediaQueue.length} items`);
+
+        while (this.mediaQueue.length > 0) {
+            const item = this.mediaQueue.shift();
+            
+            try {
+                await this.processMediaItem(item);
+                item.resolve(true);
+                
+                // Add delay between media uploads to avoid rate limiting
+                if (this.mediaQueue.length > 0) {
+                    await this.delay(5000 + Math.random() * 5000); // 5-10 second delay
+                }
+            } catch (error) {
+                logger.error(`❌ Failed to process media item:`, error.message);
+                item.reject(error);
+            }
+        }
+
+        this.processingMedia = false;
+        logger.info('✅ Media queue processing complete');
+    }
+
+    async processMediaItem({ msg, mediaType, instagramThreadId }) {
+        try {
             let fileId, fileName, caption = msg.caption || '';
 
             switch (mediaType) {
@@ -809,7 +866,7 @@ async sendWelcomeMessage(topicId, instagramThreadId, senderUserId, initialProfil
                     throw new Error(`Unsupported media type: ${mediaType}`);
             }
 
-            logger.info(`📥 Downloading ${mediaType} from Telegram: ${fileName}`);
+            logger.info(`📥 Processing ${mediaType} from Telegram: ${fileName}`);
             const fileLink = await this.telegramBot.getFileLink(fileId);
             const response = await axios.get(fileLink, { responseType: 'arraybuffer' });
             const buffer = Buffer.from(response.data);
@@ -818,33 +875,50 @@ async sendWelcomeMessage(topicId, instagramThreadId, senderUserId, initialProfil
             const tempFilePath = path.join(this.tempDir, fileName);
             await fs.writeFile(tempFilePath, buffer);
 
+            // Add retry logic for Instagram uploads
             let sendResult;
-            switch (mediaType) {
-                case 'photo':
-                case 'sticker':  // Treat stickers as photos
-                case 'animation': // Treat animations as photos for Instagram
-                    sendResult = await this.instagramBot.sendPhoto(instagramThreadId, tempFilePath, caption);
-                    break;
-                case 'video':
-                case 'video_note':
-                    sendResult = await this.instagramBot.sendVideo(instagramThreadId, tempFilePath, caption);
-                    break;
-                case 'voice':
-                    // Instagram supports voice messages
-                    sendResult = await this.instagramBot.sendVoice(instagramThreadId, tempFilePath);
-                    break;
-                case 'audio':
-                    // Instagram doesn't support audio files directly, send description instead
-                    const audioInfo = `🎵 Audio: ${msg.audio?.title || 'Audio File'} ${caption ? `\n${caption}` : ''}`;
-                    sendResult = await this.instagramBot.sendMessage(instagramThreadId, audioInfo);
-                    break;
-                case 'document':
-                    // Send document info as text since Instagram doesn't support file uploads in DMs
-                    const docInfo = `📎 Document: ${msg.document.file_name || 'File'} (${(msg.document.file_size / 1024).toFixed(2)} KB)${caption ? `\n${caption}` : ''}`;
-                    sendResult = await this.instagramBot.sendMessage(instagramThreadId, docInfo);
-                    break;
-                default:
-                    throw new Error(`Send logic not implemented for: ${mediaType}`);
+            const maxRetries = 3;
+            let retryCount = 0;
+            
+            while (retryCount < maxRetries) {
+                try {
+                    switch (mediaType) {
+                        case 'photo':
+                        case 'sticker':  // Treat stickers as photos
+                        case 'animation': // Treat animations as photos for Instagram
+                            sendResult = await this.instagramBot.sendPhoto(instagramThreadId, tempFilePath, caption);
+                            break;
+                        case 'video':
+                        case 'video_note':
+                            sendResult = await this.instagramBot.sendVideo(instagramThreadId, tempFilePath, caption);
+                            break;
+                        case 'voice':
+                            // Instagram supports voice messages
+                            sendResult = await this.instagramBot.sendVoice(instagramThreadId, tempFilePath);
+                            break;
+                        case 'audio':
+                            // Instagram doesn't support audio files directly, send description instead
+                            const audioInfo = `🎵 Audio: ${msg.audio?.title || 'Audio File'} ${caption ? `\n${caption}` : ''}`;
+                            sendResult = await this.instagramBot.sendMessage(instagramThreadId, audioInfo);
+                            break;
+                        case 'document':
+                            // Send document info as text since Instagram doesn't support file uploads in DMs
+                            const docInfo = `📎 Document: ${msg.document.file_name || 'File'} (${(msg.document.file_size / 1024).toFixed(2)} KB)${caption ? `\n${caption}` : ''}`;
+                            sendResult = await this.instagramBot.sendMessage(instagramThreadId, docInfo);
+                            break;
+                        default:
+                            throw new Error(`Send logic not implemented for: ${mediaType}`);
+                    }
+                    break; // Success, exit retry loop
+                } catch (error) {
+                    retryCount++;
+                    if (error.message?.includes('Session expired') && retryCount < maxRetries) {
+                        logger.warn(`⚠️ Session error on attempt ${retryCount}, retrying in ${retryCount * 5}s...`);
+                        await this.delay(retryCount * 5000);
+                        continue;
+                    }
+                    throw error; // Re-throw if not a session error or max retries reached
+                }
             }
 
             // Clean up temp file
@@ -861,7 +935,7 @@ async sendWelcomeMessage(topicId, instagramThreadId, senderUserId, initialProfil
                 throw new Error(`Instagram send failed for ${mediaType}`);
             }
         } catch (error) {
-            logger.error(`❌ Failed to handle/send Telegram ${mediaType} to Instagram:`, error.message);
+            logger.error(`❌ Failed to process Telegram ${mediaType} to Instagram:`, error.message);
             await this.setReaction(msg.chat.id, msg.message_id, '❌');
             
             // Send error message to Telegram as fallback
@@ -874,7 +948,12 @@ async sendWelcomeMessage(topicId, instagramThreadId, senderUserId, initialProfil
             } catch (errorSendFail) {
                 logger.error('❌ Failed to send error message back to Telegram:', errorSendFail.message);
             }
+            throw error; // Re-throw for queue handling
         }
+    }
+
+    delay(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
     }
 
     async setReaction(chatId, messageId, emoji) {
@@ -911,6 +990,15 @@ async sendWelcomeMessage(topicId, instagramThreadId, senderUserId, initialProfil
 
     async shutdown() {
         logger.info('🛑 Shutting down Instagram-Telegram bridge...');
+        
+        // Wait for media queue to finish
+        if (this.processingMedia) {
+            logger.info('⏳ Waiting for media queue to finish...');
+            while (this.processingMedia) {
+                await this.delay(1000);
+            }
+        }
+        
         if (this.telegramBot) {
             try {
                 await this.telegramBot.stopPolling();
