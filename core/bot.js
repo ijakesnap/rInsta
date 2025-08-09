@@ -836,7 +836,7 @@ async loadCookiesFromJson(path = './cookies.json') {
 
     this.log('INFO', `🕒 Started message requests monitor (checking every ${intervalMs / 1000 / 60} minutes)`);
   }
-
+}
   // --- Connection Management ---
 
   async disconnect() {
